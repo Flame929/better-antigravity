@@ -6,6 +6,7 @@
   if (window.__agHud) window.__agHud.destroy('被新注入替换');
 
   const RPC = '/exa.language_server_pb.LanguageServerService/';
+  const HUD_VERSION = '1.1.0';
   const META_INTERVAL = 3000;       // 模型调用元数据（增量）刷新间隔
   const LIVE_INTERVAL = 1000;       // 生成中状态刷新间隔
   const IDLE_LIVE_INTERVAL = 2500;  // 空闲时放慢
@@ -17,6 +18,7 @@
   const QUOTA_PREFIX = 'Gemini 3.8 Flash';
   const QUOTA_STORE = 'ag-hud-quota-v1';
   const QUOTA_WEEK_STORE = 'ag-hud-quota-week-v1';
+  const MODEL_STATS_STORE = 'ag-hud-model-stats-v1';
   const QUOTA_OBSERVE_MS = 5 * 6e4;
   const AUTO_COMPACT_STORE = 'ag-hud-auto-compact-v2';
   const COMPACT_RUN_STORE = 'ag-hud-compact-runs-v1';
@@ -162,6 +164,27 @@
     };
   }
 
+  function modelStats() {
+    return loadStore(MODEL_STATS_STORE, {});
+  }
+  function recordModelSample(model, tps, ttft) {
+    if (!model) return;
+    const stats = modelStats();
+    const row = stats[model] || { tps: [], ttft: [] };
+    if (tps > 0) row.tps = [...(row.tps || []), tps].slice(-30);
+    if (ttft > 0) row.ttft = [...(row.ttft || []), ttft].slice(-30);
+    stats[model] = row;
+    saveStore(MODEL_STATS_STORE, stats);
+  }
+  function modelBaseline(model, field) {
+    const values = model && modelStats()[model] && modelStats()[model][field];
+    if (!values || values.length < 5) return { value: 0, count: values ? values.length : 0, enough: false };
+    const sorted = values.filter(v => v > 0).sort((a, b) => a - b);
+    if (sorted.length < 5) return { value: 0, count: sorted.length, enough: false };
+    const mid = Math.floor(sorted.length / 2);
+    return { value: sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2, count: sorted.length, enough: true };
+  }
+
   // 把一条调用记录并入统计；acc 为 null 时只更新“最新值”而不累计
   function absorb(m, g, acc) {
     for (const i of g.stepIndices || []) m.maxStep = Math.max(m.maxStep, num(i));
@@ -214,6 +237,7 @@
         model: cm.responseModel || u.model,
       };
       if (acc) m.recentSpeeds = [...(m.recentSpeeds || []), m.last.tps].slice(-5);
+      if (acc === m.acc) recordModelSample(m.last.model, m.last.tps, m.last.ttft);
     }
   }
 
@@ -1090,7 +1114,31 @@
     { min: 40, color: YELLOW, text: '偏慢' },
     { min: 0, color: RED, text: '很慢' },
   ];
-  const speedLevel = tps => (tps > 0 ? SPEED_LEVELS.find(l => tps >= l.min) : null);
+  const speedLevelFixed = tps => (tps > 0 ? SPEED_LEVELS.find(l => tps >= l.min) : null);
+  function speedLevel(tps, model) {
+    if (!(tps > 0)) return null;
+    const base = modelBaseline(model, 'tps');
+    if (!base.enough) return speedLevelFixed(tps);
+    return SPEED_LEVELS.find(l => tps / base.value >= ({ '优秀': 1.15, '正常': 0.85, '偏慢': 0.6, '很慢': 0 }[l.text])) || SPEED_LEVELS[SPEED_LEVELS.length - 1];
+  }
+  function speedComparison(tps, model) {
+    const base = modelBaseline(model, 'tps');
+    if (!base.enough) return '样本不足，按固定标准';
+    const change = Math.round((tps / base.value - 1) * 100);
+    return `比平时${change >= 0 ? '快' : '慢'} ${Math.abs(change)}%`;
+  }
+  const TTFT_LEVELS = [
+    { score: 1.15, color: GREEN, text: '优秀' },
+    { score: 0.85, color: SOFT_GRAY, text: '正常' },
+    { score: 0.6, color: YELLOW, text: '偏慢' },
+    { score: 0, color: RED, text: '很慢' },
+  ];
+  function ttftLevel(ttft, model) {
+    if (!(ttft > 0)) return null;
+    const base = modelBaseline(model, 'ttft');
+    if (!base.enough) return ttft <= 1 ? TTFT_LEVELS[0] : ttft <= 2 ? TTFT_LEVELS[1] : ttft <= 4 ? TTFT_LEVELS[2] : TTFT_LEVELS[3];
+    return TTFT_LEVELS.find(l => base.value / ttft >= l.score) || TTFT_LEVELS[TTFT_LEVELS.length - 1];
+  }
 
   function quotaWindowLevel(w, prediction = w && w.pred) {
     if (!w || !prediction || !prediction.ready) return null;
@@ -1126,6 +1174,7 @@
     const arcColor = quota ? quotaArcColor(data) : contextArcColor(clamp01(fraction));
     const arc = arcPath(26, ARC_START, ARC_END);
     return '<svg class="ag-gauge ag-' + kind + '-svg" width="28" height="28" viewBox="0 0 64 64" aria-hidden="true">' +
+      (quota ? '<path class="ag-week-danger" d="' + arcPath(29, ARC_START, ARC_END) + '" fill="none" stroke="' + RED + '" stroke-width="1.2" stroke-linecap="round"/>' : '') +
       '<path class="ag-track" d="' + arc + '" fill="none" stroke="' + GRAY + '" stroke-width="5.5" stroke-linecap="round"/>' +
       '<path class="ag-arc" d="' + arc + '" pathLength="1" fill="none" stroke="' + arcColor + '" stroke-width="5.5" stroke-linecap="round" stroke-dasharray="' + arcDash(fraction) + '"/>' +
       '<g class="ag-dots">' + dots + '</g>' + icon +
@@ -1149,10 +1198,18 @@
     #${HUD_ID} .ag-bolt-icon.ag-outline-pulse{animation:ag-outline-pulse 1.5s ease-in-out infinite}
     #${HUD_ID} .ag-bolt-icon.ag-outline-pulse>path:first-of-type{fill:none;stroke:${YELLOW};stroke-width:2}
     #${HUD_ID} .ag-quota-icon{transition:fill .6s}
+    #${HUD_ID} .ag-week-danger{display:none}
+    #${HUD_ID} .ag-week-danger.show{display:block}
     #${HUD_ID} .ag-pop{display:none;position:fixed;left:8px;top:8px;box-sizing:border-box;width:300px;max-height:70vh;overflow-y:auto;overscroll-behavior:contain;padding:10px;border:1px solid var(--border);border-radius:12px;background:#fff;color:var(--foreground);box-shadow:0 8px 28px rgba(0,0,0,.14);font-size:12px;line-height:1.55;z-index:2147483647;font-variant-numeric:tabular-nums}
     body.dark #${HUD_ID} .ag-pop,body.theme-dark #${HUD_ID} .ag-pop{background:#1f1f1f;box-shadow:0 8px 28px rgba(0,0,0,.55)}
+    body.dark #${HUD_ID} .ag-tile,body.theme-dark #${HUD_ID} .ag-tile{background:rgba(255,255,255,.12)}
+    body.dark #${HUD_ID} .ag-bar,body.theme-dark #${HUD_ID} .ag-bar,body.dark #${HUD_ID} .ag-meter,body.theme-dark #${HUD_ID} .ag-meter,body.dark #${HUD_ID} .ag-spark i,body.theme-dark #${HUD_ID} .ag-spark i{background:rgba(255,255,255,.24)}
+    body.dark #${HUD_ID} .ag-meter::after,body.theme-dark #${HUD_ID} .ag-meter::after{background:rgba(255,255,255,.85);opacity:1}
     #${HUD_ID} .ag-pop.open{display:block}
     #${HUD_ID} .ag-pop h4{margin:2px 4px 8px;color:var(--muted-foreground);font-size:12px;font-weight:600}
+    #${HUD_ID} .ag-title{display:flex;align-items:center;justify-content:space-between;gap:8px}
+    #${HUD_ID} .ag-pin{display:none;padding:0;border:0;background:transparent;color:var(--muted-foreground);font:11px/1 sans-serif;cursor:pointer}
+    #${HUD_ID} .ag-pin.show{display:inline-block}
     #${HUD_ID} .ag-bento{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:6px}
     #${HUD_ID} .ag-tile{min-width:0;box-sizing:border-box;padding:9px 11px;border-radius:10px;background:rgba(127,127,127,.09)}
     #${HUD_ID} .ag-wide{grid-column:1 / -1}
@@ -1161,8 +1218,10 @@
     #${HUD_ID} .ag-label,#${HUD_ID} .ag-head,#${HUD_ID} .ag-note{color:var(--muted-foreground);font-size:11px;line-height:1.45}
     #${HUD_ID} .ag-big{margin-top:1px;color:var(--foreground);font-size:22px;font-weight:600;line-height:1.25;letter-spacing:-.01em}
     #${HUD_ID} .ag-mid{margin-top:1px;color:var(--foreground);font-size:14px;font-weight:600;line-height:1.35}
-    #${HUD_ID} .ag-bar{height:4px;margin:6px 0 5px;border-radius:999px;overflow:hidden;background:rgba(127,127,127,.18)}
+    #${HUD_ID} .ag-bar{position:relative;height:4px;margin:6px 0 12px;border-radius:999px;overflow:visible;background:rgba(127,127,127,.18)}
     #${HUD_ID} .ag-bar i{display:block;width:0;height:100%;border-radius:999px;transition:width .35s}
+    #${HUD_ID} .ag-context-bar::after{content:"";position:absolute;left:75%;top:-2px;width:1px;height:8px;background:var(--foreground);opacity:.5}
+    #${HUD_ID} .ag-context-bar::before{content:"压缩线";position:absolute;left:75%;top:7px;transform:translateX(-50%);color:var(--muted-foreground);font-size:9px;white-space:nowrap}
     #${HUD_ID} .ag-rate{display:grid;grid-template-columns:44px 72px minmax(0,1fr);align-items:center;gap:6px;margin-top:5px}
     #${HUD_ID} .ag-rate>span:first-child{color:var(--muted-foreground);font-size:11px}
     #${HUD_ID} .ag-rate>span:nth-child(2){color:var(--foreground);font-weight:600;white-space:nowrap}
@@ -1175,9 +1234,10 @@
     #${HUD_ID} .ag-speed .ag-level{justify-content:flex-start;font-size:12px}
     #${HUD_ID} .ag-spark{display:flex;align-items:flex-end;gap:4px;height:40px;flex:none}
     #${HUD_ID} .ag-spark i{display:block;width:12px;height:12%;border-radius:3px;background:rgba(127,127,127,.18);transition:height .35s}
-    #${HUD_ID} .ag-meter{position:relative;height:4px;margin:4px 0 7px;border-radius:999px;background:rgba(127,127,127,.18)}
+    #${HUD_ID} .ag-meter{position:relative;height:4px;margin:4px 0 16px;border-radius:999px;background:rgba(127,127,127,.18)}
     #${HUD_ID} .ag-meter i{display:block;width:0;height:100%;border-radius:999px;transition:width .35s}
     #${HUD_ID} .ag-meter::after{content:"";position:absolute;left:66.67%;top:-2px;width:1.5px;height:8px;background:var(--foreground);opacity:.45}
+    #${HUD_ID} .ag-meter::before{content:"安全线";position:absolute;left:66.67%;top:7px;transform:translateX(-50%);color:var(--muted-foreground);font-size:9px;white-space:nowrap}
     #${HUD_ID} .ag-row{display:flex;justify-content:space-between;gap:12px;margin:2px 0;min-width:0}
     #${HUD_ID} .ag-row span:first-child{color:var(--muted-foreground);white-space:nowrap;flex:none}
     #${HUD_ID} .ag-row span:last-child{color:var(--foreground);text-align:right;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -1202,6 +1262,11 @@
     #${HUD_ID} .ag-auto-compact{display:block;margin-top:8px;color:var(--muted-foreground);font-size:11px;white-space:nowrap}
     #${HUD_ID} .ag-compact-status{display:block;margin-top:6px;color:var(--muted-foreground)}
     #${HUD_ID} .ag-compact-status span:empty{display:none}
+    #${HUD_ID} .ag-ttft-row{display:flex;align-items:center;gap:7px;margin-top:5px;color:var(--muted-foreground);font-size:11px}
+    #${HUD_ID} .ag-ttft-row strong{color:var(--foreground);font-weight:600}
+    #${HUD_ID} .ag-footer{display:flex;justify-content:space-between;gap:8px;margin:8px 4px 0;color:var(--muted-foreground);font-size:10px}
+    #${HUD_ID} .ag-quota-chart>span{display:block;color:var(--muted-foreground);font-size:11px;text-align:center}
+    #${HUD_ID} .ag-quota-chart svg{display:block;width:100%;height:36px;margin-top:6px;overflow:visible}
     @keyframes ag-pulse{0%,100%{opacity:1}50%{opacity:.55}}
     @keyframes ag-outline-pulse{0%,100%{opacity:.65;filter:drop-shadow(0 0 0 transparent)}50%{opacity:1;filter:drop-shadow(0 0 2px ${YELLOW})}}
   `;
@@ -1215,7 +1280,17 @@
   }
 
   function onClick(e) {
-    if (e.target.closest('[data-act="compact"]')) {
+    const pin = e.target.closest('[data-act="pin"]');
+    if (pin) {
+      e.stopPropagation();
+      const item = pin.closest('.ag-item');
+      if (pinnedItems.has(item)) closePopupNow(item);
+      else {
+        pinnedItems.forEach(other => closePopupNow(other));
+        pinnedItems.add(item);
+        pin.classList.add('show');
+      }
+    } else if (e.target.closest('[data-act="compact"]')) {
       e.stopPropagation();
       smartCompact();
     } else if (e.target.closest('[data-act="compact-cancel"]')) {
@@ -1228,8 +1303,24 @@
       e.stopPropagation();
       chooseCompactDecision(false);
     } else if (e.target.closest('[data-refresh]')) {
+      const item = e.target.closest('.ag-item');
+      if (pinnedItems.has(item)) closePopupNow(item);
+      else {
+        pinnedItems.forEach(other => closePopupNow(other));
+        pinnedItems.add(item);
+        item.querySelector('[data-act="pin"]').classList.add('show');
+        item.querySelector('.ag-pop').classList.add('open');
+        activePopupItem = item;
+        positionPopup(item);
+      }
       refresh();
     }
+  }
+
+  function onPopupDismiss(e) {
+    if (e.type === 'keydown' && e.key !== 'Escape') return;
+    if (e.type === 'pointerdown' && e.target.closest(`#${HUD_ID} .ag-item`)) return;
+    if (activePopupItem) closePopupNow(activePopupItem);
   }
 
   function onChange(e) {
@@ -1295,9 +1386,33 @@
     return values;
   }
 
+  function quotaChart() {
+    const now = Math.floor(Date.now() / 60000) * 60000;
+    const history = loadHistory(QUOTA_STORE).filter(x => now - x.t <= 24 * 3.6e6).sort((a, b) => a.t - b.t);
+    // 横轴从最早的样本画到现在（最多 24 小时），记录刚开始时也能铺满卡片；不足 30 分钟不画
+    if (history.length < 2 || now - history[0].t < 30 * 6e4) return '<span>记录不足 30 分钟，稍后再看</span>';
+    const span = now - history[0].t;
+    const groups = [];
+    history.forEach(sample => {
+      const current = groups[groups.length - 1];
+      if (!current || Math.abs(Date.parse(sample.reset) - Date.parse(current[0].reset)) >= 30 * 6e4) groups.push([sample]);
+      else current.push(sample);
+    });
+    const start = history[0].t;
+    const paths = groups.filter(group => group.length > 1).map(group => {
+      const points = group.map(x => ({ x: (x.t - start) / span * 300, y: 32 - clamp01(x.f) * 26 }));
+      const line = points.map((p, i) => `${i ? 'L' : 'M'}${p.x.toFixed(1)} ${p.y.toFixed(1)}`).join(' ');
+      return `<path d="${line} L${points[points.length - 1].x.toFixed(1)} 34 L${points[0].x.toFixed(1)} 34 Z" fill="rgba(40,200,64,.18)"/><path d="${line}" fill="none" stroke="${GREEN}" stroke-width="1.5"/>`;
+    });
+    const hours = span / 3.6e6;
+    const label = `<div class="ag-head"><span>5 小时额度走势</span><span>最近 ${hours >= 1 ? `${Math.round(hours)} 小时` : `${Math.round(span / 6e4)} 分钟`}</span></div>`;
+    return paths.length ? `${label}<svg viewBox="0 0 300 36" preserveAspectRatio="none" aria-label="5 小时额度剩余比例走势">${paths.join('')}</svg>` : '<span>记录不足 30 分钟，稍后再看</span>';
+  }
+
   const popupTimers = new WeakMap();
   const popupItems = new Set();
   let activePopupItem = null;
+  const pinnedItems = new Set();
 
   function positionPopup(item) {
     const hot = item.querySelector('.ag-hot');
@@ -1315,6 +1430,7 @@
   function openPopup(item) {
     const timers = popupTimers.get(item);
     if (!timers) return;
+    if (pinnedItems.size && !pinnedItems.has(item)) return;
     const bar = document.getElementById(HUD_ID);
     if (!bar) return;
     bar.querySelectorAll('.ag-item').forEach(other => {
@@ -1322,7 +1438,7 @@
       const otherTimers = popupTimers.get(other);
       clearTimeout(otherTimers.open);
       clearTimeout(otherTimers.close);
-      other.querySelector('.ag-pop').classList.remove('open');
+      if (!pinnedItems.has(other)) other.querySelector('.ag-pop').classList.remove('open');
       if (activePopupItem === other) activePopupItem = null;
     });
     clearTimeout(timers.close);
@@ -1335,6 +1451,7 @@
   }
 
   function closePopup(item) {
+    if (pinnedItems.has(item)) return;
     const timers = popupTimers.get(item);
     clearTimeout(timers.open);
     clearTimeout(timers.close);
@@ -1347,6 +1464,9 @@
     clearTimeout(timers.close);
     item.querySelector('.ag-pop').classList.remove('open');
     if (activePopupItem === item) activePopupItem = null;
+    pinnedItems.delete(item);
+    const pin = item.querySelector('[data-act="pin"]');
+    if (pin) pin.classList.remove('show');
   }
 
   function buildHud() {
@@ -1354,11 +1474,12 @@
     const bar = document.createElement('div');
     bar.id = HUD_ID;
     bar.innerHTML = `<div class="ag-item" data-item="context"><span class="ag-hot" data-refresh tabindex="0">${gaugeSvg('context', null)}</span><div class="ag-pop">
+      <div class="ag-title"><h4>上下文与速度</h4><button class="ag-pin" data-act="pin" aria-label="固定面板">📌</button></div>
       <div class="ag-bento">
-      <div class="ag-tile ag-wide"><div class="ag-head"><span>上下文</span><span data-bind="ctx-used">等待数据</span></div><div class="ag-big" data-bind="ctx-pct">-</div><div class="ag-bar"><i data-bind="ctx-bar"></i></div></div>
+      <div class="ag-tile ag-wide"><div class="ag-head"><span>上下文</span><span data-bind="ctx-used">等待数据</span></div><div class="ag-big" data-bind="ctx-pct">-</div><div class="ag-bar ag-context-bar"><i data-bind="ctx-bar"></i></div></div>
       <div class="ag-tile"><div class="ag-label">预计还能</div><div class="ag-mid" data-bind="rounds">数据不足</div></div>
       <div class="ag-tile"><div class="ag-label">已压缩</div><div class="ag-mid" data-bind="compressions">0 次</div></div>
-      <div class="ag-tile ag-wide"><div class="ag-head"><span>速度</span><span data-bind="status">空闲</span></div><div class="ag-speed"><div><div class="ag-big"><span data-bind="live-speed">-</span><small>tok/s</small></div><span class="ag-level"><i data-bind="speed-dot"></i><b data-bind="speed-level">暂无数据</b></span></div><div class="ag-spark" data-bind="speed-spark"><i></i><i></i><i></i><i></i><i></i></div></div><div class="ag-note" data-bind="recent-speeds">-</div></div>
+      <div class="ag-tile ag-wide"><div class="ag-head"><span>速度</span><span data-bind="status">空闲</span></div><div class="ag-speed"><div><div class="ag-big"><span data-bind="live-speed">-</span><small>tok/s</small></div><span class="ag-level"><i data-bind="speed-dot"></i><b data-bind="speed-level">暂无数据</b></span><div class="ag-note" data-bind="speed-compare">样本不足，按固定标准</div><div class="ag-ttft-row"><span>首字等待</span><strong data-bind="ttft">-</strong><i data-bind="ttft-dot"></i><span data-bind="ttft-level">-</span></div></div><div class="ag-spark" data-bind="speed-spark"><i></i><i></i><i></i><i></i><i></i></div></div><div class="ag-note" data-bind="recent-speeds">-</div></div>
       <div class="ag-tile ag-wide"><div class="ag-actions"><button class="ag-btn" data-act="compact">⚡ 压缩上下文</button><button class="ag-btn" data-act="compact-cancel" hidden>取消</button></div>
       <div class="ag-row ag-compact-status" data-bind="compact-status" hidden><span></span><span></span></div><div class="ag-row ag-compact-choice" data-bind="compact-choice" hidden><span></span><span><button class="ag-btn" data-act="compact-continue">仍然压缩</button><button class="ag-btn" data-act="compact-stop">取消</button></span></div>
       <label class="ag-auto-compact"><input type="checkbox" data-act="auto-compact"> 上下文 ≥75% 时自动智能压缩</label></div>
@@ -1366,19 +1487,19 @@
       <details class="ag-more"><summary>更多</summary><div class="ag-bento">
       <div class="ag-tile ag-wide"><div class="ag-label">上下文构成</div><div data-bind="groups" class="ag-muted">暂无构成数据</div></div>
       <div class="ag-tile"><div class="ag-label">输出 token</div><div class="ag-mid" data-bind="out">-</div></div><div class="ag-tile"><div class="ag-label">思考 token</div><div class="ag-mid" data-bind="thinking">-</div></div>
-      <div class="ag-tile"><div class="ag-label">生成耗时</div><div class="ag-mid" data-bind="duration">-</div></div><div class="ag-tile"><div class="ag-label">首字等待</div><div class="ag-mid" data-bind="ttft">-</div></div>
+      <div class="ag-tile"><div class="ag-label">生成耗时</div><div class="ag-mid" data-bind="duration">-</div></div>
       <div class="ag-tile"><div class="ag-label">本对话平均</div><div class="ag-mid" data-bind="average">-</div></div><div class="ag-tile"><div class="ag-label">模型调用</div><div class="ag-mid" data-bind="calls">0 次</div></div>
       <div class="ag-tile ag-wide"><div class="ag-head"><span>模型</span><span data-bind="model">-</span></div></div>
       </div></details>
-      <div class="ag-toast" data-bind="toast" hidden></div><div class="ag-error" data-bind="error" hidden></div>
+      <div class="ag-toast" data-bind="toast" hidden></div><div class="ag-error" data-bind="error" hidden></div><div class="ag-footer"><span>v${HUD_VERSION}</span><span data-bind="latest-version"></span></div>
       </div></div><div class="ag-item" data-item="quota"><span class="ag-hot" data-refresh tabindex="0">${gaugeSvg('quota', null)}</span><div class="ag-pop">
-      <h4>${QUOTA_PREFIX} 额度</h4><div class="ag-bento">
+      <div class="ag-title"><h4>${QUOTA_PREFIX} 额度</h4><button class="ag-pin" data-act="pin" aria-label="固定面板">📌</button></div><div class="ag-bento">
       <div class="ag-tile"><div class="ag-label">5 小时</div><div class="ag-big" data-bind="quota-left">-</div><div class="ag-bar"><i data-bind="quota-bar"></i></div><div class="ag-note" data-bind="quota-reset">-</div><div class="ag-note" data-bind="quota-reset-left"></div></div>
       <div class="ag-tile"><div class="ag-label">每周</div><div class="ag-big" data-bind="quota-week-left">-</div><div class="ag-bar"><i data-bind="quota-week-bar"></i></div><div class="ag-note" data-bind="quota-week-reset">-</div><div class="ag-note" data-bind="quota-week-reset-left"></div></div>
-      <div class="ag-tile ag-wide"><div class="ag-head"><span>消耗速度</span><span>竖线 = 刚好用到重置</span></div>
+      <div class="ag-tile ag-wide"><div class="ag-head"><span>消耗速度</span><span></span></div>
       <div class="ag-rate"><span>5 小时</span><span data-bind="quota-rate">-</span><span class="ag-level"><i data-bind="quota-dot"></i><b data-bind="quota-level">观察中</b></span></div><div class="ag-meter"><i data-bind="quota-meter"></i></div>
       <div class="ag-rate"><span>每周</span><span data-bind="quota-week-rate">-</span><span class="ag-level"><i data-bind="quota-week-dot"></i><b data-bind="quota-week-level">观察中</b></span></div><div class="ag-meter"><i data-bind="quota-week-meter"></i></div>
-      <div class="ag-note" data-bind="quota-eta" hidden></div></div></div>
+      <div class="ag-note" data-bind="quota-eta" hidden></div></div><div class="ag-tile ag-wide ag-quota-chart" data-bind="quota-chart"><span>记录不足 30 分钟，稍后再看</span></div></div><div class="ag-footer"><span>v${HUD_VERSION}</span><span data-bind="latest-version">${window.__agHudLatest && window.__agHudLatest !== HUD_VERSION ? `有新版 ${window.__agHudLatest}：git pull 后运行 bash install.sh` : ''}</span></div>
       </div></div>`;
     bar.querySelectorAll('.ag-item').forEach(item => {
       popupTimers.set(item, { open: 0, close: 0 });
@@ -1578,15 +1699,17 @@
       segment.style.width = `${(breakdown[segment.dataset.stack] / groupTotal * 100).toFixed(1)}%`;
     });
     setText(bar, 'status', live.status === 'idle' ? '空闲' : `${live.label}（${fmtSec((now - live.since) / 1000)}）`);
-    const speedRating = speedLevel(tps);
+    const model = m && m.last && m.last.model;
+    const speedRating = speedLevel(tps, model);
     const recentSpeeds = (m && m.recentSpeeds) || [];
     setText(bar, 'live-speed', tps ? tps.toFixed(0) : '-');
     setText(bar, 'speed-level', speedRating ? speedRating.text : '暂无数据');
     setDot(bar, 'speed-dot', speedRating ? speedRating.color : GRAY);
+    setText(bar, 'speed-compare', tps ? speedComparison(tps, model) : '样本不足，按固定标准');
     setText(bar, 'recent-speeds', recentSpeeds.length ? `最近 ${recentSpeeds.length} 次平均 ${(recentSpeeds.reduce((a, b) => a + b, 0) / recentSpeeds.length).toFixed(0)} tok/s` : '暂无最近记录');
     bar.querySelector('[data-bind="speed-spark"]').querySelectorAll('i').forEach((column, i) => {
       const value = recentSpeeds[recentSpeeds.length - 5 + i];
-      const rating = speedLevel(value);
+      const rating = speedLevel(value, model);
       const height = `${Math.max(12, Math.round(clamp01(value / 250) * 100))}%`;
       if (column.style.height !== height) column.style.height = height;
       const color = rating ? rating.color : '';
@@ -1598,7 +1721,11 @@
     setText(bar, 'out', m && m.last ? fmtK(m.last.out) : '-');
     setText(bar, 'thinking', m && m.last ? fmtK(m.last.thinking) : '-');
     setText(bar, 'duration', m && m.last ? `${m.last.dur.toFixed(1)}s` : '-');
-    setText(bar, 'ttft', m && m.last ? `${m.last.ttft.toFixed(1)}s` : '-');
+    const ttft = m && m.last ? m.last.ttft : 0;
+    const ttftRating = ttftLevel(ttft, model);
+    setText(bar, 'ttft', ttft ? `${ttft.toFixed(1)}s` : '-');
+    setDot(bar, 'ttft-dot', ttftRating ? ttftRating.color : GRAY);
+    setText(bar, 'ttft-level', ttftRating ? ttftRating.text : '-');
     setText(bar, 'model', m && m.last ? m.last.model || '-' : '-');
     setText(bar, 'average', m && m.acc && m.acc.stream ? `${(m.acc.out / m.acc.stream).toFixed(0)} tok/s` : '-');
     setText(bar, 'calls', `${m && m.acc ? m.acc.calls : 0} 次`);
@@ -1619,6 +1746,19 @@
     const quotaIcon = quotaSvg.querySelector('.ag-quota-icon');
     const level = quotaLevel(q);
     quotaIcon.setAttribute('fill', level ? level.color : GRAY);
+    const weekLevel = quotaWindowLevel(q && q.weekly);
+    quotaSvg.querySelector('.ag-week-danger').classList.toggle('show', !!weekLevel && weekLevel.text === '按这个速度肯定不够');
+    const chart = bar.querySelector('[data-bind="quota-chart"]');
+    const chartContent = quotaChart();
+    if (chart.__content !== chartContent) {
+      chart.__content = chartContent;
+      chart.innerHTML = chartContent;
+    }
+    const latest = window.__agHudLatest;
+    const latestText = latest && latest !== HUD_VERSION ? `有新版 ${latest}：git pull 后运行 bash install.sh` : '';
+    bar.querySelectorAll('[data-bind="latest-version"]').forEach(el => {
+      if (el.textContent !== latestText) el.textContent = latestText;
+    });
     // 重置常在一两天后，只写钟点会看错日子，所以不是今天就加上日期
     const dayClock = t => (new Date(t).toDateString() === new Date(now).toDateString() ? '' : `${new Date(t).getMonth() + 1}/${new Date(t).getDate()} `) + clock(t);
     const week = q && q.weekly;
@@ -1764,6 +1904,8 @@
   observer.observe(document.documentElement, { childList: true, subtree: true });
   window.addEventListener('resize', onWindowResize);
   window.addEventListener('keydown', onShortcut, true);
+  window.addEventListener('keydown', onPopupDismiss, true);
+  window.addEventListener('pointerdown', onPopupDismiss, true);
   tick();
 
   const api = {
@@ -1786,6 +1928,8 @@
       if (layoutObserver) layoutObserver.disconnect();
       window.removeEventListener('resize', onWindowResize);
       window.removeEventListener('keydown', onShortcut, true);
+      window.removeEventListener('keydown', onPopupDismiss, true);
+      window.removeEventListener('pointerdown', onPopupDismiss, true);
       trackInputActivity(null);
       compactWaiters.forEach(cancel => cancel());
       popupItems.forEach(item => {

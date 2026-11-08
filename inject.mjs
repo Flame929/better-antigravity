@@ -14,6 +14,9 @@ const HUD_FILE = path.join(HERE, 'hud.js');
 const PORT_FILE = path.join(os.homedir(), 'Library/Application Support/Antigravity/DevToolsActivePort');
 const PAGE_PREFIX = 'https://127.0.0.1';
 const SCAN_INTERVAL = 3000;
+const VERSION_URL = 'https://raw.githubusercontent.com/Flame929/better-antigravity/main/hud.js';
+const VERSION_CHECK_INTERVAL = 24 * 60 * 60 * 1000;
+const VERSION_STATE_FILE = path.join(os.homedir(), '.antigravity-hud', 'version-check.json');
 
 const mode = process.argv.includes('--remove') ? 'remove' : process.argv.includes('--once') ? 'once' : 'daemon';
 const log = (...a) => console.log(new Date().toISOString(), ...a);
@@ -70,6 +73,34 @@ async function evaluate(session, expression) {
 
 // 每次注入都重新读取 hud.js，修改后无需重启注入器
 const hudSource = () => fs.readFileSync(HUD_FILE, 'utf8');
+function versionNumber(source) {
+  return source.match(/HUD_VERSION\s*=\s*['"](\d+\.\d+\.\d+)['"]/)?.[1] || null;
+}
+function versionIsNewer(remote, local) {
+  if (!remote || !local) return false;
+  const a = remote.split('.').map(Number);
+  const b = local.split('.').map(Number);
+  for (let i = 0; i < 3; i++) {
+    if (a[i] !== b[i]) return a[i] > b[i];
+  }
+  return false;
+}
+async function latestVersion() {
+  try {
+    const res = await fetch(VERSION_URL, { signal: AbortSignal.timeout(5000) });
+    if (!res.ok) return null;
+    const remote = versionNumber(await res.text());
+    return versionIsNewer(remote, versionNumber(hudSource())) ? remote : null;
+  } catch {
+    return null;
+  }
+}
+function readVersionState() {
+  try { return JSON.parse(fs.readFileSync(VERSION_STATE_FILE, 'utf8')); } catch { return null; }
+}
+function saveVersionState(checkedAt, version) {
+  try { fs.writeFileSync(VERSION_STATE_FILE, JSON.stringify({ checkedAt, version })); } catch {}
+}
 
 async function runOnce(remove) {
   const port = readPort();
@@ -87,6 +118,9 @@ async function runOnce(remove) {
 // 常驻模式：为每个主界面窗口保持一个会话，页面重新加载后再次注入
 async function daemon() {
   const sessions = new Map(); // targetId -> session
+  const versionState = readVersionState();
+  let versionCheckedAt = versionState?.checkedAt || 0;
+  let latest = versionState?.version || null;
   log('注入器已启动，等待 Antigravity…');
 
   async function attach(page) {
@@ -107,12 +141,23 @@ async function daemon() {
   }
 
   for (;;) {
+    if (Date.now() - versionCheckedAt >= VERSION_CHECK_INTERVAL) {
+      versionCheckedAt = Date.now();
+      latest = await latestVersion();
+      saveVersionState(versionCheckedAt, latest);
+      for (const s of sessions.values()) {
+        await evaluate(s, `window.__agHudLatest=${JSON.stringify(latest || '')}`).catch(() => {});
+      }
+    }
     try {
       const port = readPort();
       if (port) {
         const pages = await listPages(port);
         for (const p of pages) {
           if (!sessions.has(p.id)) await attach(p).catch(e => log('连接失败', e.message));
+        }
+        if (latest) {
+          for (const s of sessions.values()) await evaluate(s, `window.__agHudLatest=${JSON.stringify(latest)}`).catch(() => {});
         }
       }
     } catch {
