@@ -1,9 +1,18 @@
 # Better Antigravity
 
+[中文](README.md) | [English](README.en.md)
+
 给 Google Antigravity 2 桌面应用（macOS）加的输入框状态仪表和智能压缩。
 不修改应用文件：通过应用自带的 Chrome 远程调试端口，把 `hud.js` 注入到主界面网页。
 
-在 Antigravity 2.27 / 2.28 上实测可用。应用更新后，界面结构或内部接口可能变化，需要重新验证。
+在 Antigravity 2.27–2.29（macOS）上实测可用。应用更新后，界面结构或内部接口可能变化，需要重新验证。
+
+## 截图
+
+| 正常状态（浅色） | 额度告急（深色） |
+|---|---|
+| <img src="docs/screenshots/normal-light-context.png" width="320" alt="上下文与速度面板"> | <img src="docs/screenshots/danger-dark-context.png" width="320" alt="上下文与速度面板（深色）"> |
+| <img src="docs/screenshots/normal-light-quota.png" width="320" alt="额度面板"> | <img src="docs/screenshots/danger-dark-quota.png" width="320" alt="额度面板（深色，额度告急）"> |
 
 ## 功能
 - **上下文仪表**：圆弧表示上下文已用比例，75% 位置有“压缩线”；中心闪电按 tok/s 填充。速度按同一模型最近 30 次调用的中位数评级，样本不足 5 次时按固定标准；同时显示首字等待（TTFT）评级和最近 5 次柱状图。
@@ -23,12 +32,39 @@
 | `tools/safe-inject.mjs` | 体检：`node tools/safe-inject.mjs 30` 注入后 30 秒监测响应、CPU、布局，异常自动卸载 |
 | `tools/cdplib.mjs` | CDP 连接小工具，供体检和调试脚本使用 |
 
-## 在新电脑上复现
-1. 安装 Antigravity 2 和 Node.js 22 以上。
-2. 复制全局规则：`mkdir -p ~/.gemini/config && cp GEMINI.md ~/.gemini/config/GEMINI.md`
-   - 注意位置是 `~/.gemini/config/`，**不是** `~/.gemini/GEMINI.md`（后者是旧版 Gemini CLI 的，Antigravity 2 不读）。
-3. 先体检一次：打开 Antigravity，运行 `node tools/safe-inject.mjs 30`，看到“✅ 通过”再继续。
-4. 没问题再安装自动注入：`bash install.sh`（日志在 `~/.antigravity-hud/inject.log`）。
+## 安装
+
+需要 macOS、Node.js 22 及以上，以及 Antigravity 2（已在 2.27–2.29 上测试）。
+
+一行安装：
+
+```bash
+git clone https://github.com/Flame929/better-antigravity.git ~/better-antigravity && cd ~/better-antigravity && bash install.sh
+```
+
+安装脚本会把 HUD 复制到 `~/.antigravity-hud`，并注册登录后自动运行的 LaunchAgent；日志在 `~/.antigravity-hud/inject.log`。
+
+建议再复制全局规则（智能压缩要靠它写、读交接文档）：
+
+```bash
+mkdir -p ~/.gemini/config && cp GEMINI.md ~/.gemini/config/GEMINI.md
+```
+
+注意位置是 `~/.gemini/config/`，**不是** `~/.gemini/GEMINI.md`（后者是旧版 Gemini CLI 的，Antigravity 2 不读）。
+
+想先体检再长期运行：打开 Antigravity，在仓库目录运行 `node tools/safe-inject.mjs 30`，看到“✅ 通过”后再执行 `bash install.sh`。
+
+## 更新
+
+```bash
+cd ~/better-antigravity && git pull && bash install.sh
+```
+
+## 卸载
+
+```bash
+cd ~/better-antigravity && bash uninstall.sh
+```
 
 ## 原理要点（排查用）
 - **调试端口**：Antigravity 每次启动都开 Chrome 远程调试（`remote-debugging-port=0`，随机端口），端口写在
