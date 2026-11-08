@@ -1098,10 +1098,9 @@
     return { ...QUOTA_LEVELS.find(l => ratio < l.max), ratio, rate: prediction.rate, eta: prediction.eta, reset: Date.parse(w.reset) };
   }
 
-  // 5 小时和每周两个窗口各算一次，星星取更危险的那个
+  // 星星只看 5 小时窗口；每周窗口的速度只在面板里显示
   function quotaLevel(q, prediction = q && q.pred) {
-    const levels = [quotaWindowLevel(q, prediction), quotaWindowLevel(q && q.weekly)].filter(Boolean);
-    return levels.reduce((worst, l) => (!worst || l.ratio > worst.ratio ? l : worst), null);
+    return quotaWindowLevel(q, prediction);
   }
 
   function quotaCenterIcon(q, prediction = q && q.pred) {
