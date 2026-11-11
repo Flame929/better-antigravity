@@ -6,7 +6,7 @@
   if (window.__agHud) window.__agHud.destroy('被新注入替换');
 
   const RPC = '/exa.language_server_pb.LanguageServerService/';
-  const HUD_VERSION = '1.1.0';
+  const HUD_VERSION = '1.1.1';
   const META_INTERVAL = 3000;       // 模型调用元数据（增量）刷新间隔
   const LIVE_INTERVAL = 1000;       // 生成中状态刷新间隔
   const IDLE_LIVE_INTERVAL = 2500;  // 空闲时放慢
@@ -18,7 +18,7 @@
   const QUOTA_PREFIX = 'Gemini 3.8 Flash';
   const QUOTA_STORE = 'ag-hud-quota-v1';
   const QUOTA_WEEK_STORE = 'ag-hud-quota-week-v1';
-  const MODEL_STATS_STORE = 'ag-hud-model-stats-v1';
+  const MODEL_STATS_STORE = 'ag-hud-model-stats-v3';
   const QUOTA_OBSERVE_MS = 5 * 6e4;
   const AUTO_COMPACT_STORE = 'ag-hud-auto-compact-v2';
   const COMPACT_RUN_STORE = 'ag-hud-compact-runs-v1';
@@ -167,10 +167,14 @@
   function modelStats() {
     return loadStore(MODEL_STATS_STORE, {});
   }
-  function recordModelSample(model, tps, ttft) {
+  function recordModelSample(model, tps, ttft, id) {
     if (!model) return;
     const stats = modelStats();
     const row = stats[model] || { tps: [], ttft: [] };
+    if (id) {
+      if ((row.ids || []).includes(id)) return;
+      row.ids = [...(row.ids || []), id].slice(-60);
+    }
     if (tps > 0) row.tps = [...(row.tps || []), tps].slice(-30);
     if (ttft > 0) row.ttft = [...(row.ttft || []), ttft].slice(-30);
     stats[model] = row;
@@ -220,9 +224,13 @@
       acc.input += input;
       acc.cache += cache;
     }
+    // outputTokens 已包含思考 token，而思考在首字等待期间就在生成；
+    // 只除以流式时长会把速度算高一两倍，所以按 全部输出 ÷（首字等待 + 流式时长）算
+    const ttft = seconds(cm.timeToFirstToken);
+    const total = ttft + dur;
+    const tps = total ? out / total : 0;
     // 过滤太短或明显异常的速度样本
-    const tps = dur ? out / dur : 0;
-    if (out > 0 && dur >= 1.5 && tps <= 800) {
+    if (out > 0 && total >= 1.5 && tps <= 800) {
       if (acc) {
         acc.out += out;
         acc.stream += dur;
@@ -231,13 +239,14 @@
         tps,
         out,
         thinking: num(u.thinkingOutputTokens),
-        ttft: seconds(cm.timeToFirstToken),
+        ttft,
         dur,
         hit: input + cache ? cache / (input + cache) : 0,
         model: cm.responseModel || u.model,
       };
       if (acc) m.recentSpeeds = [...(m.recentSpeeds || []), m.last.tps].slice(-5);
-      if (acc === m.acc) recordModelSample(m.last.model, m.last.tps, m.last.ttft);
+      // 输出太短的调用，时间几乎都花在读上下文上，不代表生成速度，不进基线
+      if (acc === m.acc && !m.provisional && out >= 200) recordModelSample(m.last.model, m.last.tps, m.last.ttft, u.responseId || u.messageId);
     }
   }
 
@@ -257,7 +266,8 @@
       // 前面的调用已经结束，计入累计；最后一条可能还在进行，只做临时统计，下次重新拉
       list.slice(0, -1).forEach(g => absorb(m, g, m.acc));
       m.settled += Math.max(0, list.length - 1);
-      const view = { ...m, acc: { ...m.acc }, ctxHistory: [...(m.ctxHistory || [])], recentSpeeds: [...(m.recentSpeeds || [])] };
+      // 最后一条调用可能还没结束，view 只用来显示，provisional 让它不进模型基线
+      const view = { ...m, provisional: true, acc: { ...m.acc }, ctxHistory: [...(m.ctxHistory || [])], recentSpeeds: [...(m.recentSpeeds || [])] };
       if (list.length) absorb(view, list[list.length - 1], view.acc);
       state.meta = m;
       state.metaView = view;
@@ -410,7 +420,7 @@
   }
 
   // 根据同一个重置周期内的剩余比例变化，估算消耗速度和用完时间。
-  // 5 小时窗口看最近 1 小时、观察不足 30 分钟按 30 分钟算；周窗口看最近 6 小时、不足 2 小时按 2 小时算
+  // 5 小时窗口看最近 1 小时、观察不足 30 分钟按 30 分钟算；周窗口改用整个周期的平均速度（见 predictWeekly）
   const QUOTA_WINDOWS = {
     '5h': { store: QUOTA_STORE, lookback: 60 * 6e4, floor: 30 * 6e4 },
     weekly: { store: QUOTA_WEEK_STORE, lookback: 6 * 3.6e6, floor: 2 * 3.6e6 },
@@ -418,6 +428,7 @@
   function predict(q, win = '5h') {
     const cfg = QUOTA_WINDOWS[win];
     const now = Date.now();
+    if (win === 'weekly') return predictWeekly(q, now);
     let h = loadHistory(cfg.store).filter(x => now - x.t < 48 * 3.6e6);
     const prev = h[h.length - 1];
     if (!prev || prev.f !== q.remaining || prev.reset !== q.reset || now - prev.t > 10 * 6e4) {
@@ -430,6 +441,17 @@
     const old = h.find(x => now - x.t <= cfg.lookback);
     if (!old || now - old.t < QUOTA_OBSERVE_MS) return { rate: 0, eta: 0, ready: false };
     const rate = Math.max(0, old.f - q.remaining) / Math.max(now - old.t, cfg.floor); // 每毫秒消耗的比例
+    return { rate, eta: rate ? now + q.remaining / rate : 0, ready: true };
+  }
+
+  // 每周额度：人不会 24 小时连续用，拿最近几小时的速度外推到整周会一直显示“不够”。
+  // 改用本周期开始（重置时间往前 7 天）到现在的平均速度，睡觉、空闲的时间也算进去；开始不到 1 小时先不出结果
+  function predictWeekly(q, now) {
+    const reset = Date.parse(q.reset);
+    const start = reset - 7 * 24 * 3.6e6;
+    const elapsed = now - start;
+    if (!Number.isFinite(reset) || elapsed < 3.6e6 || elapsed > 7 * 24 * 3.6e6) return { rate: 0, eta: 0, ready: false };
+    const rate = Math.max(0, 1 - q.remaining) / elapsed;
     return { rate, eta: rate ? now + q.remaining / rate : 0, ready: true };
   }
 
@@ -1770,7 +1792,10 @@
       setText(bar, `${key}-left`, w ? pct(w.remaining) : '-');
       setBar(bar, `${key}-bar`, w ? w.remaining : 0, quotaArcColor(w));
       setText(bar, `${key}-reset`, hasReset ? `${dayClock(resetAt)} 重置` : '-');
-      setText(bar, `${key}-reset-left`, hasReset ? `${fmtLeft(Math.max(0, resetAt - now))}后` : '');
+      // 到了重置时间，接口里的剩余比例还是旧的：先标“已重置”，并立刻重新拉一次（30 秒内最多一次）
+      const justReset = hasReset && resetAt <= now;
+      if (justReset && now - state.at.quota > 30000) refreshQuota(true);
+      setText(bar, `${key}-reset-left`, justReset ? '已重置，正在刷新' : hasReset ? `${fmtLeft(resetAt - now)}后` : '');
       setText(bar, `${key}-rate`, windowLevel ? `${(windowLevel.rate * 3.6e6 * 100).toFixed(1)}%/时` : '-');
       setText(bar, `${key}-level`, windowLevel ? windowLevel.text : '观察中');
       setDot(bar, `${key}-dot`, windowLevel ? windowLevel.color : GRAY);
