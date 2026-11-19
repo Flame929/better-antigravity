@@ -35,9 +35,18 @@ cat > "$PLIST" <<EOF
 </plist>
 EOF
 
+# Antigravity 2.33 起调试端口改为启动参数开启：编译一个带参数启动的启动器，图标沿用 Antigravity 的
+APP="$HOME/Applications/Antigravity HUD.app"
+mkdir -p "$HOME/Applications"
+rm -rf "$APP"
+osacompile -o "$APP" "$SRC/launcher/launcher.applescript"
+ICON="$(ls /Applications/Antigravity.app/Contents/Resources/*.icns 2>/dev/null | head -1 || true)"
+[ -n "$ICON" ] && cp "$ICON" "$APP/Contents/Resources/applet.icns" && touch "$APP"
+
 launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
 # bootout 是异步的，等旧进程完全退出再 bootstrap，否则会报 Input/output error
 for _ in 1 2 3 4 5 6 7 8 9 10; do launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || break; sleep 0.5; done
 launchctl bootstrap "gui/$(id -u)" "$PLIST"
 echo "已安装到 $DEST，注入器已在后台运行（日志：$DEST/inject.log）"
 echo "以后修改 $DEST/hud.js 后，刷新一次 Antigravity 窗口（Cmd+R）即可生效"
+echo "请用 $APP 打开 Antigravity（可以拖进 Dock 代替原图标）：2.33 起只有带调试端口启动，HUD 才能注入"

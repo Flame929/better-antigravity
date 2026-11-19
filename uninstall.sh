@@ -10,4 +10,5 @@ launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null
 [ -f "$DEST/inject.mjs" ] && node "$DEST/inject.mjs" --remove 2>/dev/null
 rm -f "$PLIST"
 rm -rf "$DEST"
+rm -rf "$HOME/Applications/Antigravity HUD.app"
 echo "已卸载 Antigravity HUD"

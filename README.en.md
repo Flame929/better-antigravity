@@ -4,7 +4,7 @@
 
 A status HUD for the Google Antigravity 2 desktop app on macOS. It puts live context-window and Gemini quota gauges next to the input box, and can compact a long conversation for you. Nothing inside the app is patched: a small injector attaches to the Chrome DevTools port that Antigravity already opens, then loads `hud.js` into the main window.
 
-Tested with Antigravity 2.27–2.29 on macOS. After an app update, page structure or internal APIs may change and the HUD needs to be re-checked.
+Tested with Antigravity 2.27–2.33 on macOS. After an app update, page structure or internal APIs may change and the HUD needs to be re-checked.
 
 ## Screenshots
 
@@ -18,7 +18,7 @@ The HUD interface is currently in Chinese; these screenshots show the actual UI.
 ## Features
 
 - **Context gauge.** An arc shows how much of the context window is used, with a "compaction line" at 75%. The lightning bolt in the middle fills according to output speed in tok/s. Speed is rated against the median of the last 30 calls to the same model (a fixed baseline is used until there are 5 samples), and time-to-first-token gets its own rating and a 5-call bar chart.
-- **Quota gauge.** Gemini has a 5-hour limit and a weekly limit. The arc shows what is left of the 5-hour window; the stars only react to the 5-hour burn rate. A thin red ring appears outside the gauge only when the weekly burn rate means "you will definitely run out at this pace". The panel also shows the safety line, a 24-hour remaining-quota curve (broken at resets), and the next 5 reset countdowns.
+- **Quota gauge.** The quota follows the model selected in the input box: Gemini models show the Gemini group, Claude and GPT models show their shared group. Each group has a 5-hour limit and a weekly limit. The arc shows what is left of the 5-hour window; the stars only react to the 5-hour burn rate. A thin red ring appears outside the gauge only when the weekly burn rate means "you will definitely run out at this pace". The panel also shows the safety line, a 24-hour remaining-quota curve (broken at resets), and the next 5 reset countdowns.
 - **How speed and weekly pace are measured.** The output token count reported by the model includes thinking tokens, and thinking starts during the time-to-first-token wait, so speed is total output ÷ (time to first token + streaming time). Weekly pace is the average since the current weekly cycle began (reset time minus 7 days), idle hours included, instead of extrapolating the last few busy hours across the whole week.
 - **Pinned panels.** Click a gauge to pin its panel; it stays open when the pointer leaves. Click the pin again, press Esc, or click outside to close. The two panels show the HUD version and an update hint at the bottom.
 - **Compaction that survives re-injection.** Progress is kept in localStorage, so a re-injected HUD continues where it left off instead of sending step 1/2 again within 30 minutes. If the AI has just written a handoff document, only step 2/2 is sent. `window.__agHud.log()` shows the last 50 events, including why the HUD was torn down.
@@ -27,7 +27,7 @@ The HUD interface is currently in Chinese; these screenshots show the actual UI.
 
 ## Install
 
-Requirements: macOS, Node.js 22 or newer, and Antigravity 2 (tested with 2.27–2.29).
+Requirements: macOS, Node.js 22 or newer, and Antigravity 2 (tested with 2.27–2.33).
 
 One-liner:
 
@@ -36,6 +36,8 @@ git clone https://github.com/Flame929/better-antigravity.git ~/better-antigravit
 ```
 
 The installer copies the HUD to `~/.antigravity-hud` and registers a LaunchAgent that keeps it running after login. The log is at `~/.antigravity-hud/inject.log`.
+
+**From Antigravity 2.33, open the app with the launcher.** The app now opens its remote debugging port only when started with `--remote-debugging-port`, and the HUD needs that port. The installer creates `~/Applications/Antigravity HUD.app`; drag it into the Dock in place of the regular Antigravity icon. If Antigravity is already running without the port, the launcher asks before restarting it. Note that with the port open, other programs on this Mac can control Antigravity (it is reachable from this machine only).
 
 Then copy the global rules (smart compaction uses them to write and read the handoff document):
 
@@ -87,6 +89,7 @@ This stops the injector, removes the LaunchAgent and `~/.antigravity-hud`, and r
 | `hud.js` | The HUD injected into the page (gauges, panels, smart compaction); safe to re-inject, a newer version replaces the old one |
 | `inject.mjs` | Injector: `node inject.mjs` runs it continuously; `--once` injects once; `--remove` removes the HUD |
 | `install.sh` / `uninstall.sh` | Install / uninstall the login LaunchAgent |
+| `launcher/launcher.applescript` | Launcher source: opens Antigravity with the debugging port; built into `~/Applications/Antigravity HUD.app` on install |
 | `GEMINI.md` | Global rules (handoff-document convention), copied to `~/.gemini/config/GEMINI.md` |
 | `tools/safe-inject.mjs` | Health check: injects, then monitors responsiveness, CPU, and layout for 30 seconds and unloads on trouble |
 | `tools/cdplib.mjs` | Small CDP helper used by the health check and debugging scripts |

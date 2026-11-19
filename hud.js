@@ -6,7 +6,7 @@
   if (window.__agHud) window.__agHud.destroy('被新注入替换');
 
   const RPC = '/exa.language_server_pb.LanguageServerService/';
-  const HUD_VERSION = '1.1.1';
+  const HUD_VERSION = '1.2.0';
   const META_INTERVAL = 3000;       // 模型调用元数据（增量）刷新间隔
   const LIVE_INTERVAL = 1000;       // 生成中状态刷新间隔
   const IDLE_LIVE_INTERVAL = 2500;  // 空闲时放慢
@@ -15,9 +15,12 @@
   const AUTO_THRESHOLD_DEFAULT = 0.75;
   const AUTO_IDLE_MS_DEFAULT = 20000;
   const BACKGROUND_CHECK_INTERVAL = 30000;
-  const QUOTA_PREFIX = 'Gemini 3.8 Flash';
-  const QUOTA_STORE = 'ag-hud-quota-v1';
-  const QUOTA_WEEK_STORE = 'ag-hud-quota-week-v1';
+  // 额度按输入框里选中的模型显示：Gemini 一组，Claude / GPT 一组，两组各有 5 小时和每周限额
+  const QUOTA_GROUPS = {
+    gemini: { test: /gemini/i, store: 'ag-hud-quota-v1', weekStore: 'ag-hud-quota-week-v1' },
+    other: { test: null, store: 'ag-hud-quota-3p-v1', weekStore: 'ag-hud-quota-week-3p-v1' },
+  };
+  const QUOTA_STORE = QUOTA_GROUPS.gemini.store;
   const MODEL_STATS_STORE = 'ag-hud-model-stats-v3';
   const QUOTA_OBSERVE_MS = 5 * 6e4;
   const AUTO_COMPACT_STORE = 'ag-hud-auto-compact-v2';
@@ -61,7 +64,7 @@
     cascadeId: null,
     meta: null,     // 当前对话的模型调用统计（增量累计）
     live: null,     // 当前生成状态
-    quota: null,    // Gemini 3.8 Flash 额度
+    quota: null,    // 当前所选模型那一组的额度
     compactUntil: 0,
     compact: {
       step: 'idle',
@@ -422,11 +425,10 @@
   // 根据同一个重置周期内的剩余比例变化，估算消耗速度和用完时间。
   // 5 小时窗口看最近 1 小时、观察不足 30 分钟按 30 分钟算；周窗口改用整个周期的平均速度（见 predictWeekly）
   const QUOTA_WINDOWS = {
-    '5h': { store: QUOTA_STORE, lookback: 60 * 6e4, floor: 30 * 6e4 },
-    weekly: { store: QUOTA_WEEK_STORE, lookback: 6 * 3.6e6, floor: 2 * 3.6e6 },
+    '5h': { lookback: 60 * 6e4, floor: 30 * 6e4 },
   };
   function predict(q, win = '5h') {
-    const cfg = QUOTA_WINDOWS[win];
+    const cfg = { ...QUOTA_WINDOWS['5h'], store: (QUOTA_GROUPS[q.group] || QUOTA_GROUPS.gemini).store };
     const now = Date.now();
     if (win === 'weekly') return predictWeekly(q, now);
     let h = loadHistory(cfg.store).filter(x => now - x.t < 48 * 3.6e6);
@@ -455,13 +457,22 @@
     return { rate, eta: rate ? now + q.remaining / rate : 0, ready: true };
   }
 
+  // 输入框里选中的模型，例如“Gemini 3.8 Flash High”；去掉末尾的思考档位作为显示名
+  function selectedModel() {
+    const trigger = document.querySelector('[data-testid="model-selector-trigger"]');
+    const label = trigger ? (trigger.textContent || '').replace(/\s+/g, ' ').trim() : '';
+    const name = label.replace(/\s*[（(]?\b(High|Medium|Low|Thinking)\b[)）]?\s*$/i, '').trim() || label;
+    return { label, name, group: /gemini/i.test(label) || !label ? 'gemini' : 'other' };
+  }
+
   // Gemini 有 5 小时和每周两个限额，设置页的数据来自 RetrieveUserQuotaSummary；
   // GetUserStatus 只给两者中更紧的那个，作为接口不可用时的退路
-  async function fetchGeminiBuckets() {
+  async function fetchQuotaBuckets(groupKey) {
     try {
       const json = await rpc('RetrieveUserQuotaSummary', {});
       const groups = (json.response && json.response.groups) || [];
-      const group = groups.find(g => /gemini/i.test(g.displayName || '') || (g.buckets || []).some(b => /gemini/i.test(b.bucketId || '')));
+      const isGemini = g => /gemini/i.test(g.displayName || '') || (g.buckets || []).some(b => /gemini/i.test(b.bucketId || ''));
+      const group = groups.find(g => (groupKey === 'gemini' ? isGemini(g) : !isGemini(g)));
       const buckets = (group && group.buckets) || [];
       const pick = win => {
         const b = buckets.find(x => String(x.window || '').toLowerCase() === win);
@@ -478,9 +489,10 @@
     if (!force && Date.now() - state.at.quota < QUOTA_INTERVAL) return;
     state.at.quota = Date.now();
     try {
-      const buckets = await fetchGeminiBuckets();
+      const model = selectedModel();
+      const buckets = await fetchQuotaBuckets(model.group);
       if (buckets) {
-        const q = { ...buckets.five, weekly: buckets.weekly };
+        const q = { ...buckets.five, weekly: buckets.weekly, group: model.group, model: model.name };
         q.pred = predict(q, '5h');
         if (q.weekly) q.weekly.pred = predict(q.weekly, 'weekly');
         state.quota = q;
@@ -490,7 +502,7 @@
       const cfg = json.userStatus && json.userStatus.cascadeModelConfigData;
       // High/Medium/Low 合并成一条：取最低剩余比例和最早的重置时间
       const list = ((cfg && cfg.clientModelConfigs) || [])
-        .filter(m => m.label && m.label.startsWith(QUOTA_PREFIX) && m.quotaInfo && m.quotaInfo.resetTime);
+        .filter(m => m.label && model.name && m.label.startsWith(model.name) && m.quotaInfo && m.quotaInfo.resetTime);
       if (!list.length) return;
       const resets = list.map(m => ({ raw: m.quotaInfo.resetTime, time: Date.parse(m.quotaInfo.resetTime) }));
       const validResets = resets.filter(x => Number.isFinite(x.time));
@@ -500,6 +512,8 @@
       const q = {
         remaining: Math.min(...list.map(m => num(m.quotaInfo.remainingFraction))),
         reset,
+        group: model.group,
+        model: model.name,
       };
       q.pred = predict(q);
       state.quota = q;
@@ -1408,9 +1422,9 @@
     return values;
   }
 
-  function quotaChart() {
+  function quotaChart(group) {
     const now = Math.floor(Date.now() / 60000) * 60000;
-    const history = loadHistory(QUOTA_STORE).filter(x => now - x.t <= 24 * 3.6e6).sort((a, b) => a.t - b.t);
+    const history = loadHistory((QUOTA_GROUPS[group] || QUOTA_GROUPS.gemini).store).filter(x => now - x.t <= 24 * 3.6e6).sort((a, b) => a.t - b.t);
     // 横轴从最早的样本画到现在（最多 24 小时），记录刚开始时也能铺满卡片；不足 30 分钟不画
     if (history.length < 2 || now - history[0].t < 30 * 6e4) return '<span>记录不足 30 分钟，稍后再看</span>';
     const span = now - history[0].t;
@@ -1515,7 +1529,7 @@
       </div></details>
       <div class="ag-toast" data-bind="toast" hidden></div><div class="ag-error" data-bind="error" hidden></div><div class="ag-footer"><span>v${HUD_VERSION}</span><span data-bind="latest-version"></span></div>
       </div></div><div class="ag-item" data-item="quota"><span class="ag-hot" data-refresh tabindex="0">${gaugeSvg('quota', null)}</span><div class="ag-pop">
-      <div class="ag-title"><h4>${QUOTA_PREFIX} 额度</h4><button class="ag-pin" data-act="pin" aria-label="固定面板">📌</button></div><div class="ag-bento">
+      <div class="ag-title"><h4 data-bind="quota-title">额度</h4><button class="ag-pin" data-act="pin" aria-label="固定面板">📌</button></div><div class="ag-bento">
       <div class="ag-tile"><div class="ag-label">5 小时</div><div class="ag-big" data-bind="quota-left">-</div><div class="ag-bar"><i data-bind="quota-bar"></i></div><div class="ag-note" data-bind="quota-reset">-</div><div class="ag-note" data-bind="quota-reset-left"></div></div>
       <div class="ag-tile"><div class="ag-label">每周</div><div class="ag-big" data-bind="quota-week-left">-</div><div class="ag-bar"><i data-bind="quota-week-bar"></i></div><div class="ag-note" data-bind="quota-week-reset">-</div><div class="ag-note" data-bind="quota-week-reset-left"></div></div>
       <div class="ag-tile ag-wide"><div class="ag-head"><span>消耗速度</span><span></span></div>
@@ -1566,13 +1580,18 @@
   let layoutObserver = null;
   let layoutRaf = 0;
 
+  // HUD 改了自己的宽度可能挤动模型选择器，又触发尺寸监听，某些窗口宽度下会来回抖动；
+  // 所以尺寸变化引起的重绘每 100ms 最多一次
+  let lastLayoutRender = 0;
   function scheduleLayoutRender() {
     layoutCache.dirty = true;
     if (destroyed || layoutRaf) return;
-    layoutRaf = requestAnimationFrame(() => {
+    const wait = Math.max(0, 100 - (performance.now() - lastLayoutRender));
+    layoutRaf = setTimeout(() => requestAnimationFrame(() => {
       layoutRaf = 0;
+      lastLayoutRender = performance.now();
       if (!destroyed) render();
-    });
+    }), wait);
   }
 
   function syncLayoutObservers(anchor, box) {
@@ -1633,6 +1652,8 @@
 
   // 熔断：一秒内渲染超过 30 次说明出现了循环，立刻卸载 HUD，保证不会卡住应用
   let renderBurst = { start: 0, count: 0 };
+  let renderPausedUntil = 0;
+  let burstTimes = [];
   let remountBurst = { start: 0, count: 0 };
   let destroyed = false;
   let destroyHud = () => {};
@@ -1645,8 +1666,16 @@
       else renderBurst = { start: burstNow, count: 0 };
     }
     const activeBurst = kind === 'remount' ? remountBurst : renderBurst;
+    if (burstNow < renderPausedUntil) return;
     if (++activeBurst.count > (kind === 'remount' ? 20 : 30)) {
       if (kind === 'remount') return;
+      // 分级熔断：一分钟内前两次只暂停重绘 3 秒，第三次才卸载，避免偶发的布局抖动把 HUD 整个关掉
+      burstTimes = [...burstTimes.filter(t => burstNow - t < 60000), burstNow];
+      if (burstTimes.length < 3) {
+        renderPausedUntil = burstNow + 3000;
+        appendEvent('throttle', { count: burstTimes.length, cascadeId: state.cascadeId });
+        return;
+      }
       console.warn('[Antigravity HUD] 渲染过于频繁，已自动关闭以保护界面');
       destroyHud('熔断');
       return;
@@ -1680,7 +1709,11 @@
     const now = Date.now();
     const m = state.metaView;
     const live = state.live || { status: 'idle', tps: 0, since: 0, label: '' };
-    const q = state.quota;
+    // 额度跟着输入框里选中的模型走：换到另一组（Gemini ⇄ Claude / GPT）时先不显示旧组的数据，并立刻重新拉
+    const picked = selectedModel();
+    const q = state.quota && state.quota.group === picked.group ? state.quota : null;
+    if (!q && now - state.at.quota > 5000) refreshQuota(true);
+    setText(bar, 'quota-title', `${picked.name || 'Gemini'} 额度`);
     const ctx = m && m.ctx && m.ctx.max ? m.ctx : null;
     const ctxF = ctx ? clamp01(ctx.used / ctx.max) : 0;
     const active = live.status !== 'idle';
@@ -1771,7 +1804,7 @@
     const weekLevel = quotaWindowLevel(q && q.weekly);
     quotaSvg.querySelector('.ag-week-danger').classList.toggle('show', !!weekLevel && weekLevel.text === '按这个速度肯定不够');
     const chart = bar.querySelector('[data-bind="quota-chart"]');
-    const chartContent = quotaChart();
+    const chartContent = quotaChart(q && q.group);
     if (chart.__content !== chartContent) {
       chart.__content = chartContent;
       chart.innerHTML = chartContent;
@@ -1948,7 +1981,7 @@
       clearInterval(timer);
       clearInterval(backgroundTimer);
       if (remountRaf) cancelAnimationFrame(remountRaf);
-      if (layoutRaf) cancelAnimationFrame(layoutRaf);
+      if (layoutRaf) clearTimeout(layoutRaf);
       observer.disconnect();
       if (layoutObserver) layoutObserver.disconnect();
       window.removeEventListener('resize', onWindowResize);
